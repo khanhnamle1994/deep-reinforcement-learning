@@ -7,6 +7,10 @@ import tensorflow                as tf
 import tensorflow.contrib.layers as layers
 from collections import namedtuple
 from dqn_utils import *
+import logging
+
+def d(s):
+    logging.getLogger('dqn').debug(s)
 
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs", "lr_schedule"])
 
@@ -24,6 +28,7 @@ def learn(env,
           frame_history_len=4,
           target_update_freq=10000,
           grad_norm_clipping=10):
+
     """Run Deep Q-learning algorithm.
 
     You can specify your own convnet using q_func.
@@ -89,6 +94,9 @@ def learn(env,
         input_shape = (img_h, img_w, frame_history_len * img_c)
     num_actions = env.action_space.n
 
+    d('input_shape = {}'.format(input_shape))
+    d('num_actions = {}'.format(num_actions))
+
     # set up placeholders
     # placeholder for current observation (or state)
     obs_t_ph              = tf.placeholder(tf.uint8, [None] + list(input_shape))
@@ -128,16 +136,32 @@ def learn(env,
     ######
 
     # YOUR CODE HERE
-    q_t = q_func(obs_t_float, num_actions, scope="q_func", reuse=False)
-    greedy_action = tf.argmax(q_t, axis=1)
 
-    q_tp1 = q_func(obs_tp1_float, num_actions, scope="target_q_func", reuse=False)
-    target = rew_t_ph + (1.0 - done_mask_ph) * gamma * tf.reduce_max(q_tp1, axis=1)
-    q_t_act = tf.reduce_sum(q_t * tf.one_hot(act_t_ph, num_actions), axis=1)
-    total_error = tf.losses.mean_squared_error(target, q_t_act)
+    # Q values
+    pred_q = q_func(obs_t_float, num_actions, scope="q_func", reuse=False)
+    pred_ac = tf.argmax(pred_q, axis=1)
+    pred_q_a = tf.reduce_sum(pred_q * tf.one_hot(act_t_ph, depth=num_actions), axis=1)
 
+    # Target
+    target_q = q_func(obs_tp1_float, num_actions, scope="q_func_target", reuse=False)
+    target_q_a = rew_t_ph + (1 - done_mask_ph) * gamma * tf.reduce_max(target_q, axis=1)
+
+    # Loss
+    #total_error = huber_loss(pred_q_a, target_q_a)
+    #total_error = tf.nn.l2_loss(pred_q_a - target_q_a)
+    total_error = 0.5 * tf.reduce_sum(tf.square(pred_q_a - tf.stop_gradient(target_q_a)))
+
+    # Get variables
     q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
-    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
+    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func_target')
+
+    d("pred_q = {}".format(pred_q))
+    d("target_q = {}".format(target_q))
+
+    d("pred_ac = {}".format(pred_ac))
+    d("pred_q_a = {}".format(pred_q_a))
+    d("target_q_a = {}".format(target_q_a))
+    d("total_error = {}".format(total_error))
 
     ######
 
@@ -205,20 +229,17 @@ def learn(env,
         #####
 
         # YOUR CODE HERE
-        replay_buffer.store_frame(last_obs)
+        idx = replay_buffer.store_frame(last_obs)
 
         if not model_initialized or random.random() < exploration.value(t):
-            action = random.randint(0, num_actions - 1)
+            action = random.randint(0, num_actions-1)
         else:
             obs = replay_buffer.encode_recent_observation()
-            action = session.run(greedy_action, {obs_t_ph: [obs]})
+            action = session.run(pred_ac, {obs_t_ph: [obs]})[0]
 
-        next_obs, reward, done, _ = env.step(action)
-        if done:
-            last_obs = env.reset()
-
-        replay_buffer.store_effect(action, reward, done)
-        last_obs = next_obs
+        next_obs, reward, done, info = env.step(action)
+        replay_buffer.store_effect(idx, action, reward, done)
+        last_obs = env.reset() if done else next_obs
 
         #####
 
@@ -269,27 +290,36 @@ def learn(env,
             #####
 
             # YOUR CODE HERE
-            obs_batch, act_batch, rew_batch, obs_tp1_batch, done_batch = replay_buffer.sample(batch_size)
+            # 3.a sample a batch of transitions
+            obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = replay_buffer.sample(batch_size)
 
+            # 3.b initialize the model if haven't
             if not model_initialized:
                 initialize_interdependent_variables(session, tf.global_variables(), {
                     obs_t_ph: obs_batch,
-                    obs_tp1_ph: obs_tp1_batch,
+                    obs_tp1_ph: next_obs_batch,
                 })
+                session.run(update_target_fn)
                 model_initialized = True
 
-            session.run(train_fn, {
+            # 3.c train the model
+            _, error = session.run([train_fn, total_error], {
                 obs_t_ph: obs_batch,
                 act_t_ph: act_batch,
                 rew_t_ph: rew_batch,
-                obs_tp1_ph: obs_tp1_batch,
+                obs_tp1_ph: next_obs_batch,
                 done_mask_ph: done_batch,
-                learning_rate: optimizer_spec.lr_schedule.value(t),
-            })
+                learning_rate: optimizer_spec.lr_schedule.value(t)
+                })
 
-            num_param_updates += 1
-            if num_param_updates % target_update_freq == 0:
+            # 3.d periodically update the target network
+            if t % target_update_freq == 0:
+                # Use t here instead of num_param_updates
+                # Under the default hyperparameter
+                # this will speed up learning performance
+                # Or you can set target_update_freq to less
                 session.run(update_target_fn)
+                num_param_updates += 1
 
             #####
 
