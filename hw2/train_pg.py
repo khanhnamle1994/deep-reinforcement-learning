@@ -1,7 +1,6 @@
 import numpy as np
 import tensorflow as tf
 import gym
-import roboschool
 import logz
 import scipy.signal
 import os
@@ -9,13 +8,13 @@ import time
 import inspect
 from multiprocessing import Process
 
+# Suppress CPU instruction set warning
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
+
 #============================================================================================#
 # Utilities
 #============================================================================================#
-
-def normalize(data, mean=0.0, std=1.0):
-    n_data = (data - np.mean(data)) / (np.std(data) + 1e-8)
-    return n_data * (std + 1e-8) + mean
 
 def build_mlp(
         input_placeholder,
@@ -40,11 +39,18 @@ def build_mlp(
 
     with tf.variable_scope(scope):
         # YOUR_CODE_HERE
-        out = input_placeholder
-        for l in range(n_layers):
-            out = tf.layers.dense(inputs=out, units=size, activation=activation)
-        out = tf.layers.dense(inputs=out, units=output_size, activation=output_activation)
-        return out
+        dense = input_placeholder
+        # [Learn] No need to create a dense layer of size=input_size to accept input
+        #   The connection in the set-up below will be [input_size, units]
+        for i in range(n_layers):
+            dense = tf.layers.dense(
+                        inputs=dense,
+                        units=size,
+                        activation=activation)
+        return tf.layers.dense(
+            inputs=dense,
+            units=output_size,
+            activation=output_activation)
 
 def pathlength(path):
     return len(path["reward"])
@@ -181,32 +187,47 @@ def train_PG(exp_name='',
 
     if discrete:
         # YOUR_CODE_HERE
-        # Compute stochastic policy over discrete actions
-        sy_logits_na = build_mlp(sy_ob_no, ac_dim, "policy", n_layers=n_layers, size=size)
-
-        # Sample an action from the stochastic policy
-        sy_sampled_nac = tf.multinomial(sy_logits_na, 1)
-        sy_sampled_nac = tf.reshape(sy_sampled_nac, [-1])
-
-        # Likelihood of chosen action
-        sy_logprob_n = -tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=sy_nac, logits=sy_logits_na)
+        sy_logits_na = build_mlp(
+            input_placeholder=sy_ob_no,
+            output_size=ac_dim,
+            scope="build_nn",
+            n_layers=n_layers,
+            size=size,
+            activation=tf.nn.relu) # Avoid softmax on output layer,
+                # as we are going to use softmax_cross_entropy for logprob.
+                # See https://www.tensorflow.org/api_docs/python/tf/nn/
+                # softmax_cross_entropy_with_logits
+        # [Learn] Use tf.multinomial
+        # [Learn] Use tf.squeeze to get rid of dimension=1
+        sy_sampled_ac = tf.squeeze(tf.multinomial(sy_logits_na, 1), axis=[1])
+        # [Learn] sparse_softmax_cross_entropy_with_logits
+        #   skip one hot encoding in softmax_cross_entropy
+        sy_logprob_n = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=sy_ac_na,
+            logits=sy_logits_na)
 
     else:
         # YOUR_CODE_HERE
-        # Compute Gaussian stochastic policy over continuous actions.
-        # The mean is a function of observations, while the variance is not.
-        sy_mean_na = build_mlp(sy_ob_no, ac_dim, "policy", n_layers=n_layers, size=size)
-        sy_logstd = tf.Variable(tf.zeros([1, ac_dim]), name="policy/logstd", dtype=tf.float32)
-        sy_std = tf.exp(sy_logstd)
+        sy_mean = build_mlp(
+            input_placeholder=sy_ob_no,
+            output_size=ac_dim,
+            scope="build_nn",
+            n_layers=n_layers,
+            size=size,
+            activation=tf.nn.relu)
 
-        # Sample an action from the stochastic policy
-        sy_sampled_z = tf.random_normal(tf.shape(sy_mean_na))
-        sy_sampled_nac = sy_mean_na + sy_std * sy_sampled_z
-
-        # Likelihood of chosen action
-        sy_z = (sy_nac - sy_mean_na) / sy_std
-        sy_logprob_n = -0.5 * tf.reduce_sum(tf.square(sy_z), axis=1)
+        # logstd should just be a trainable variable, not a network output??
+        sy_logstd = tf.get_variable("logstd",shape=[ac_dim])
+        sy_sampled_ac = sy_mean + tf.multiply(tf.exp(sy_logstd),
+                                              tf.random_normal(tf.shape(sy_mean)))
+        # Hint: Use the log probability under a multivariate gaussian.
+        # Learned from github.com/mwhittaker
+        # [Learn] MultivariateNormalDiag in tensorflow library
+        dist = tf.contrib.distributions.MultivariateNormalDiag(loc=sy_mean,
+            scale_diag=tf.exp(sy_logstd))
+        sy_logprob_n = -dist.log_prob(sy_ac_na)
+        # [Learn] Do the negate here works;
+        #   Do it in loss / weighted_negative_likelihood not work.
 
 
 
@@ -237,8 +258,8 @@ def train_PG(exp_name='',
         # Define placeholders for targets, a loss function and an update op for fitting a
         # neural network baseline. These will be used to fit the neural network baseline.
         # YOUR_CODE_HERE
-        sy_target_n = tf.placeholder(shape=[None], name="target", dtype=tf.float32)
-        baseline_loss = tf.nn.l2_loss(baseline_prediction - sy_target_n)
+        baseline_target = tf.placeholder(shape=[None], dtype=tf.float32)
+        baseline_loss = tf.losses.mean_squared_error(predictions=baseline_prediction, labels=baseline_target)
         baseline_update_op = tf.train.AdamOptimizer(learning_rate).minimize(baseline_loss)
 
 
@@ -355,21 +376,24 @@ def train_PG(exp_name='',
         #====================================================================================#
 
         # YOUR_CODE_HERE
+        def discount_rewards_to_go(rewards, gamma):
+            res = []
+            future_reward = 0
+            for r in reversed(rewards):
+                future_reward = future_reward * gamma + r
+                res.append(future_reward)
+            return res[::-1]
+
+        def sum_discount_rewards(rewards, gamma):
+            return sum((gamma**i) * rewards[i] for i in range(len(rewards)))
+
         q_n = []
-        for path in paths:
-            q = 0
-            q_path = []
-
-            # Dynamic programming over reversed path
-            for rew in reversed(path["reward"]):
-                q = rew + gamma * q
-                q_path.append(q)
-            q_path.reverse()
-
-            # Append these q values
-            if not reward_to_go:
-                q_path = [q_path[0]] * len(q_path)
-            q_n.extend(q_path)
+        if reward_to_go:
+            q_n = np.concatenate([discount_rewards_to_go(path["reward"], gamma) for path in paths])
+        else:
+            q_n = np.concatenate([
+                    [sum_discount_rewards(path["reward"], gamma)] * pathlength(path)
+                    for path in paths])
 
         #====================================================================================#
         #                           ----------SECTION 5----------
@@ -443,8 +467,10 @@ def train_PG(exp_name='',
             # targets to have mean zero and std=1. (Goes with Hint #bl1 above.)
 
             # YOUR_CODE_HERE
-            q_normalized_n = normalize(q_n)
-            sess.run(baseline_update_op, feed_dict={sy_ob_no : ob_no, sy_target_n : q_normalized_n})
+            scaled_q = (q_n - np.mean(q_n)) / np.std(q_n)
+            _ = sess.run(baseline_update_op, feed_dict={
+                sy_ob_no : ob_no,
+                baseline_target: scaled_q})
 
         #====================================================================================#
         #                           ----------SECTION 4----------
@@ -458,7 +484,10 @@ def train_PG(exp_name='',
         # and after an update, and then log them below.
 
         # YOUR_CODE_HERE
-        sess.run(update_op, feed_dict={sy_ob_no : ob_no, sy_nac : ac_nac, sy_adv_n : adv_n})
+        # [Learn] Tensorflow fetches in session.run
+        # https://www.tensorflow.org/versions/r0.12/api_docs/python/client/session_management#Session.run
+        _, loss_value = sess.run([update_op, loss], feed_dict={sy_ob_no: ob_no,
+            sy_ac_na: ac_na,sy_adv_n: adv_n})
 
         # Log diagnostics
         returns = [path["reward"].sum() for path in paths]
